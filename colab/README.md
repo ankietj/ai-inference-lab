@@ -4,7 +4,7 @@ This guide details how to execute physical GPU inference benchmarks against clou
 
 ---
 
-## 1. Quick Start: Executing Benchmark V2 in Google Colab
+## 1. Quick Start: Executing Benchmark V2 (Offline Batch) in Google Colab
 
 ### Prerequisites
 1. Open a new notebook at [Google Colab](https://colab.research.google.com).
@@ -73,7 +73,7 @@ The validation script automatically detects GPU VRAM and selects an open model t
 
 ---
 
-## 4. Measurement Boundaries & Metric Definitions
+## 4. Measurement Boundaries & Metric Definitions (V2 Offline)
 
 To ensure scientific integrity and prevent conflating offline batch processing with online serving:
 
@@ -88,7 +88,7 @@ To ensure scientific integrity and prevent conflating offline batch processing w
 
 ---
 
-## 5. Output Schemas & Artifact Separation
+## 5. Output Schemas & Artifact Separation (V2 Offline)
 
 All V1 physical artifacts remain preserved and untouched in `results/physical_t4_v1/`.
 V2 runs produce separate, isolated artifacts:
@@ -177,3 +177,133 @@ V2 runs produce separate, isolated artifacts:
   ]
 }
 ```
+
+---
+
+## 6. Phase 3: Online-Serving Benchmark & SLO Capacity Validation
+
+Phase 3 transitions from offline batch testing to **open-loop online serving** via vLLM's OpenAI-compatible HTTP streaming server.
+
+### Research Objective
+Determine which tested open-loop request arrival rates meet explicit latency and error objectives for vLLM serving `Qwen/Qwen2.5-1.5B-Instruct` on a Tesla T4.
+
+### Execution in Google Colab
+
+#### Cell 1: Install Dependencies
+```bash
+!pip install --quiet vllm httpx
+```
+
+#### Cell 2: Launch vLLM Server with Health Verification & Logging
+Running background servers with raw bash `&` can be terminated by Jupyter upon cell completion. Instead, launch the server using Python's `subprocess.Popen` with log redirection and health polling:
+
+```python
+import subprocess
+import sys
+import time
+import httpx
+
+# Start server in background with log redirection
+server_log = open("vllm_server.log", "w")
+server_proc = subprocess.Popen([
+    sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+    "--model", "Qwen/Qwen2.5-1.5B-Instruct",
+    "--dtype", "float16",
+    "--gpu-memory-utilization", "0.90",
+    "--max-model-len", "2048",
+    "--port", "8000"
+], stdout=server_log, stderr=subprocess.STDOUT)
+
+print("vLLM server process launched (PID:", server_proc.pid, "). Awaiting health endpoint...")
+
+# Poll health endpoint until ready (timeout 180s)
+for attempt in range(60):
+    try:
+        r = httpx.get("http://localhost:8000/health", timeout=3.0)
+        if r.status_code == 200:
+            print("vLLM server is healthy and ready to serve requests.")
+            break
+    except Exception:
+        pass
+    time.sleep(3.0)
+else:
+    server_proc.terminate()
+    try:
+        server_proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        server_proc.kill()
+    server_log.close()
+    print("FATAL: Server failed health check within 180s. Tail of vllm_server.log:")
+    try:
+        with open("vllm_server.log") as f:
+            print("".join(f.readlines()[-40:]))
+    except Exception:
+        pass
+    raise RuntimeError(
+        "vLLM server failed health check within 180s. Process terminated. Halting execution before benchmark."
+    )
+```
+
+#### Cell 3: Execute Phase 3 Open-Loop Serving Benchmark
+```bash
+!python colab/vllm_online_benchmark.py \
+  --rates 0.5 1.0 2.5 4.5 6.0 \
+  --pilot-duration 60 \
+  --confirmation-duration 120 \
+  --max-error-rate 0.05 \
+  --output colab_vllm_online_results.json
+```
+
+#### Cell 4: Download Benchmark Results (Retrieve Before Disconnect)
+In Google Colab, the local virtual disk is ephemeral. Retrieve the benchmark JSON immediately upon completion:
+
+```python
+from google.colab import files
+files.download("colab_vllm_online_results.json")
+```
+
+*(Optional Alternative: Mount Google Drive and copy directly)*:
+```python
+# from google.colab import drive
+# drive.mount('/content/drive')
+# import shutil
+# shutil.copy("colab_vllm_online_results.json", "/content/drive/MyDrive/colab_vllm_online_results.json")
+# print("Results successfully copied to Google Drive.")
+```
+
+#### Cell 5: Graceful Server Cleanup (Post-Benchmark)
+```python
+if 'server_proc' in locals() and server_proc.poll() is None:
+    server_proc.terminate()
+    server_proc.wait(timeout=10)
+    server_log.close()
+    print("vLLM server process terminated cleanly.")
+```
+
+### Key Online Serving Concepts & Boundaries
+
+1. **Open-Loop Poisson Arrivals vs. Concurrency**:
+   - Requests arrive from an independent stochastic process: $\Delta t \sim \text{Exponential}(\lambda)$.
+   - Scheduled arrival times are fixed in advance and independent of server latency.
+   - Dispatch delay (`dispatch_delay_ms`) records positive scheduling jitter between scheduled offset and actual socket send.
+2. **Exploratory Pilot Rates & Confirmation**:
+   - Rates `[0.5, 1.0, 2.5, 4.5, 6.0]` req/s are exploratory pilot probes, not guaranteed safe bounds.
+   - 60-second pilot windows test initial stability; the highest promising rate is confirmed in a 120-second window.
+   - Requires at least 20 completed requests to certify an SLO pass; otherwise labeled `INCONCLUSIVE`.
+3. **Drain Period & Incomplete Streams**:
+   - When the scheduled window expires, dispatch stops and a 30–45s drain window begins.
+   - Streams terminating without `[DONE]` or a valid `finish_reason` are explicitly marked `"incomplete"` and count as errors.
+4. **Provisional Service Level Objectives (SLOs)**:
+   - **TTFT Objective**: $\text{TTFT}_{p95} \le 150\text{ ms}$ (Dispatch to first content chunk).
+   - **E2E Latency Objective**: $\text{E2E}_{p95} \le 3000\text{ ms}$ (Dispatch to final chunk completion).
+   - **Error Rate Objective**: $\text{Error Rate} = 0.0\%$ (Zero observed errors or dropped streams in the finite sample).
+   - Formal status is reported as `PASS`, `FAIL`, or `INCONCLUSIVE`.
+5. **Safety Circuit Breaker**:
+   - Halts the stage if $\ge 3$ consecutive timeouts occur or running error rate exceeds 5% (`max_error_rate=0.05`), preserving partial records.
+   - Any stage that trips the circuit breaker is automatically labeled `FAIL`.
+6. **Token Accounting & Distinct Throughput Metrics**:
+   - Exact token counts are extracted from streaming `usage.completion_tokens` metadata when provided. If unavailable, token counts and token throughput are reported as `null` (`None`). Word splitting is never used as a proxy.
+   - Reports both `actual_dispatch_rate_req_s` ($N_{\text{dispatched}} / T_{\text{window}}$) and `physical_service_throughput_req_s` ($N_{\text{completed}} / T_{\text{total\_elapsed\_including\_drain}}$).
+7. **Colab Colocation Limitation**:
+   - Client and server communicate over loopback (`localhost:8000`).
+   - Results reflect engine queueing and continuous batching, NOT public internet transit or production gateway routing.
